@@ -15,6 +15,7 @@ type ConsulService struct {
 	Address   string
 	Port      int
 	ServiceID string
+	Node      string
 }
 
 // NoMasterElected return whether any Consul elected Redis master exist

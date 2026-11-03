@@ -1,6 +1,7 @@
 package consul
 
 import (
+	"sync"
 	"time"
 
 	"github.com/aireuropa/resec/resec/state"
@@ -14,7 +15,9 @@ type Manager struct {
 	client       consulClient      // consul API client
 	clientConfig *consulapi.Config // consul API client configuration
 	config       *config           // configuration for this connection
-	lockCh       <-chan struct{}   // lock channel used by Consul SDK to notify about changes
+	lockCh       chan struct{}     // closed on shutdown to abort a blocked Lock() call
+	lockChOnce   sync.Once         // makes sure lockCh is closed only once
+	mu           sync.Mutex        // protects state and config.voluntarilyReleaseLockCh
 	lockErrorCh  <-chan struct{}   // lock error channel used by Consul SDK to notify about errors related to the lock
 	logger       *log.Entry        // logger for the consul connection struct
 	state        *state.Consul     // state used by the reconciler
@@ -29,6 +32,7 @@ type config struct {
 	announceHost             string              // host (IP) to announce to Consul
 	announcePort             int                 // port to announce to Consul
 	checkID                  string              // consul check ID
+	nodeName                 string              // name of the local Consul agent node (cached)
 	deregisterServiceAfter   time.Duration       // after how long time in warnign should service be auto-deregistered
 	lock                     *consulapi.Lock     // Consul Lock instance
 	lockKey                  string              // Consul KV key to lock

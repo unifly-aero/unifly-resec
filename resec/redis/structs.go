@@ -2,8 +2,8 @@ package redis
 
 import (
 	"github.com/aireuropa/resec/resec/state"
-	"github.com/go-redis/redis"
 	"github.com/jpillora/backoff"
+	"github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
 )
 

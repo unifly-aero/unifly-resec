@@ -1,0 +1,14 @@
+.git
+.github
+.vs
+build
+demo
+example
+hooks
+vendor
+*.md
+*.png
+*.svg
+.travis.yml
+dump.rdb
+derp

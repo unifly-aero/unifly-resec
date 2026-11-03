@@ -3,6 +3,7 @@ package reconciler
 
 import (
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ type helper struct {
 	redisCommandsSeen      []redis.CommandName
 	redisStateCh           chan state.Redis
 	t                      *testing.T
+	mu                     sync.Mutex // protects the *CommandsSeen slices
 }
 
 // consume all consul/redis commands from the reconciler
@@ -34,9 +36,13 @@ func (h *helper) consume() {
 			case <-h.reconciler.stopCh:
 				return
 			case cmd := <-h.redisCommandCh:
+				h.mu.Lock()
 				h.redisCommandsSeen = append(h.redisCommandsSeen, cmd.Name())
+				h.mu.Unlock()
 			case cmd := <-h.consulCommandCh:
+				h.mu.Lock()
 				h.consulCommandsSeen = append(h.consulCommandsSeen, cmd.Name())
+				h.mu.Unlock()
 			}
 		}
 	}()
@@ -77,14 +83,18 @@ func (h *helper) eval(expectedResult resultType) {
 	assert.EqualValues(h.t, string(expectedResult), string(actualResult))
 	time.Sleep(5 * time.Millisecond)
 
+	h.mu.Lock()
 	assert.EqualValues(h.t, h.consulCommandsExpected, h.consulCommandsSeen)
 	assert.EqualValues(h.t, h.redisCommandsExpected, h.redisCommandsSeen)
+	h.mu.Unlock()
 
 	h.reset()
 }
 
 // reset the internal assertions
 func (h *helper) reset() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.consulCommandsExpected = []consul.CommandName{}
 	h.consulCommandsSeen = []consul.CommandName{}
 	h.redisCommandsExpected = []redis.CommandName{}

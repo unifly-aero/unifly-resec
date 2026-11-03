@@ -1,31 +1,26 @@
 # Build layer
-FROM golang:1.18 AS builder
-WORKDIR /go/src/github.com/aireuropa/resec
+FROM golang:1.27-alpine AS builder
+
+ARG RESEC_VERSION=local-dev
+
+RUN apk --no-cache add ca-certificates && \
+    addgroup -g 1000 -S app && \
+    adduser -S -G app -u 1000 -H app && \
+    mkdir -p /out/app && chown 1000:1000 /out/app
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
-ARG RESEC_VERSION
-ENV RESEC_VERSION ${RESEC_VERSION:-local-dev}
-RUN echo $RESEC_VERSION
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-X 'main.Version=${RESEC_VERSION}'" -a -installsuffix cgo -o build/resec  .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 GOOS=linux \
+    go build -trimpath -ldflags="-s -w -X 'main.Version=${RESEC_VERSION}'" -o /out/app/resec .
 
 # Run layer
-FROM alpine:latest
-RUN apk --no-cache add ca-certificates && \
-export exe=`exec 2>/dev/null; readlink "/proc/$$/exe"| rev | cut  -f 1 -d '/' | rev` && \
-case "$exe" in \
-    'busybox') \
-        echo "Busybox: $exe"; \
-        getent group  1000 || addgroup -g 1000 -S app; \
-        getent passwd 1000 || adduser -S -G app -u 1000 app; \
-        ;; \
-    *) \
-        echo "Not Busybox: $exe"; \
-        getent group  1000 || addgroup --gid 1000 --system  app; \
-        getent passwd 1000 || adduser --system --no-create-home --ingroup app  --uid 1000 app; \
-        ;; \
-esac && \
-mkdir /app/ && \
-chown 1000:1000 /app
-USER 1000
-WORKDIR /app 
-COPY --from=builder /go/src/github.com/aireuropa/resec/build/resec .
-CMD ["./resec"]
+FROM scratch
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /etc/passwd /etc/group /etc/
+COPY --from=builder --chown=1000:1000 /out/app /app
+USER 1000:1000
+WORKDIR /app
+ENTRYPOINT ["/app/resec"]

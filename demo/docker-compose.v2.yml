@@ -1,0 +1,80 @@
+# Quorum-loss test for resec:v2
+#   docker compose -f demo/docker-compose.v2.yml up -d
+#   curl -s localhost:8081/health ; curl -s localhost:8082/health
+#   docker compose -f demo/docker-compose.v2.yml stop consul-server-2 consul-server-3   # quorum lost
+#   docker compose -f demo/docker-compose.v2.yml start consul-server-2 consul-server-3  # quorum back
+# Observer page (status of Consul, Redis, resec and log flow): http://localhost:8090
+services:
+
+  consul-server-1: &consul-server
+    image: hashicorp/consul:1.22.3
+    networks: [resec-demo]
+    ports:
+      - "8500:8500"
+    command: "agent -server -bootstrap-expect 3 -retry-join consul-server-1 -retry-join consul-server-2 -retry-join consul-server-3 -ui -client 0.0.0.0"
+
+  consul-server-2:
+    <<: *consul-server
+    ports: []
+
+  consul-server-3:
+    <<: *consul-server
+    ports: []
+
+  consul-resec-1: &consul-agent
+    image: hashicorp/consul:1.22.3
+    networks: [resec-demo]
+    hostname: consul-resec-1
+    command: "agent -retry-join consul-server-1 -retry-join consul-server-2 -retry-join consul-server-3 -client 0.0.0.0"
+
+  consul-resec-2:
+    <<: *consul-agent
+    hostname: consul-resec-2
+
+  redis-resec-1: &redis
+    image: redis:8.8.0
+    hostname: redis-resec-1
+    networks: [resec-demo]
+
+  redis-resec-2:
+    <<: *redis
+    hostname: redis-resec-2
+
+  resec-1: &resec
+    image: resec:v2.0.0-rc
+    build: ..
+    hostname: resec-1
+    networks: [resec-demo]
+    ports:
+      - "8081:8080"
+    environment: &resec-env
+      REDIS_ADDR: redis-resec-1:6379
+      CONSUL_HTTP_ADDR: http://consul-resec-1:8500
+      STATE_SERVER: "true"
+      LOG_LEVEL: info
+    depends_on: [consul-resec-1, redis-resec-1]
+
+  resec-2:
+    <<: *resec
+    hostname: resec-2
+    ports:
+      - "8082:8080"
+    environment:
+      <<: *resec-env
+      REDIS_ADDR: redis-resec-2:6379
+      CONSUL_HTTP_ADDR: http://consul-resec-2:8500
+    depends_on: [consul-resec-2, redis-resec-2]
+
+  observer:
+    image: python:3.12-alpine
+    networks: [resec-demo]
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./observer:/app:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    security_opt: ["label=disable"]  # SELinux: allow access to docker.sock
+    command: ["python", "-u", "/app/server.py"]
+
+networks:
+  resec-demo:

@@ -52,7 +52,7 @@ func main() {
 		&cli.IntFlag{
 			Name:    "consul-lock-monitor-retries",
 			Usage:   "Number of retries of lock receives 500 Error from Consul",
-			Value:   3,
+			Value:   30,
 			EnvVars: []string{"CONSUL_LOCK_MONITOR_RETRIES"},
 		},
 		&cli.DurationFlag{
@@ -92,6 +92,18 @@ func main() {
 			Name:    "consul-slave-tags",
 			Usage:   "Comma separated list of tags to be added to slave instance. The first tag (index 0) is used to configure the role of the Redis/resec task, and must be different from index 0 in MASTER_TAGS",
 			EnvVars: []string{"SLAVE_TAGS"},
+		},
+		&cli.DurationFlag{
+			Name:    "health-consul-timeout",
+			Usage:   "Timeout for the live Consul KV read of the lock key done by /health",
+			Value:   2 * time.Second,
+			EnvVars: []string{"HEALTH_CONSUL_TIMEOUT"},
+		},
+		&cli.IntFlag{
+			Name:    "health-consul-failures",
+			Usage:   "Number of consecutive failed Consul KV reads before /health fails",
+			Value:   1,
+			EnvVars: []string{"HEALTH_CONSUL_FAILURES"},
 		},
 		&cli.DurationFlag{
 			Name:    "healthcheck-interval",

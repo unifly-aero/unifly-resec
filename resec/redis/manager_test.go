@@ -143,3 +143,10 @@ repl_backlog_histlen:1526`),
 func newlinefix(s string) string {
 	return strings.Replace(s, "\n", "\r\n", -1)
 }
+
+func TestManager_parseKeyValue_IPv6(t *testing.T) {
+	m := &Manager{}
+	kv := m.parseKeyValue("role:slave\r\nmaster_host:fd00::1\r\nmaster_port:6379")
+	assert.Equal(t, "fd00::1", kv["master_host"])
+	assert.Equal(t, "6379", kv["master_port"])
+}

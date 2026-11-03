@@ -78,6 +78,8 @@ EORC
         CONSUL_HTTP_ADDR = "http://${attr.unique.network.ip-address}:8500"
         REDIS_ADDR = "${NOMAD_ADDR_db}"
         STATE_SERVER = "1"
+        # keep below the check timeout (5s)
+        HEALTH_CONSUL_TIMEOUT = "2s"
       }
 
       resources {
@@ -92,6 +94,11 @@ EORC
           path = "/health"
           interval = "10s"
           timeout = "5s"
+
+          check_restart {
+            limit = 3
+            grace = "30s"
+          }
         }
       }
     }

@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Resec Observer</title>
+<style>
+:root {
+  --bg: #f4f5f7; --panel: #ffffff; --line: #dfe2e7; --text: #1d2330; --muted: #6b7385;
+  --ok: #1f8a4c; --ok-bg: #e3f4ea; --warn: #a86a00; --warn-bg: #fff2d6;
+  --bad: #c0352b; --bad-bg: #fde6e4; --off: #8a91a0; --off-bg: #eceef2;
+  --accent: #3d5afe; --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --log-bg: #fbfbfc;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1a1e26; --line: #2b313d; --text: #e3e6ec; --muted: #8d95a6;
+    --ok: #4cc47f; --ok-bg: #173323; --warn: #e6b34a; --warn-bg: #3a2e14;
+    --bad: #ff6b5e; --bad-bg: #3d1c1a; --off: #7b8394; --off-bg: #252a34;
+    --accent: #7c93ff; --log-bg: #151920;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+  border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+header .meta { color: var(--muted); font-size: 12px; }
+header .spacer { flex: 1; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; background: var(--off); }
+.dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); } .dot.warn { background: var(--warn); }
+main { padding: 16px 20px; display: grid; gap: 16px; }
+h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+  margin: 0 0 8px; font-weight: 600; }
+
+.summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  border-left: 4px solid var(--off); }
+.tile.ok { border-left-color: var(--ok); } .tile.bad { border-left-color: var(--bad); background: var(--bad-bg); }
+.tile.warn { border-left-color: var(--warn); }
+.tile .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.tile .v { font-size: 18px; font-weight: 650; margin-top: 2px; word-break: break-word; }
+.tile .s { font-size: 12px; color: var(--muted); margin-top: 2px; font-family: var(--mono); word-break: break-word; }
+
+.cols { display: grid; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); gap: 16px; align-items: start; }
+.servers { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+.nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.node { background: transparent; border: 1px dashed var(--line); border-radius: 10px; padding: 10px; display: grid; gap: 8px; }
+.node > .title { font-weight: 650; font-size: 13px; color: var(--muted); }
+
+.scenarios { display: grid; gap: 6px; }
+.scenario { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+.scenario summary { display: flex; align-items: center; gap: 10px; cursor: pointer; font-weight: 600; }
+.scenario summary .count { margin-left: auto; font-size: 11px; color: var(--muted); font-weight: 400; }
+.scenario ul { margin: 6px 0 2px; padding-left: 18px; font-family: var(--mono); font-size: 12px; }
+.scenario li.fail { color: var(--bad); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.card .head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.card .name { font-weight: 600; font-family: var(--mono); font-size: 13px; }
+.card .kind { font-size: 11px; color: var(--muted); margin-left: auto; }
+.card.down { opacity: .65; }
+.badge { font-size: 11px; font-weight: 650; padding: 1px 7px; border-radius: 10px; background: var(--off-bg); color: var(--off);
+  white-space: nowrap; }
+.badge.ok { background: var(--ok-bg); color: var(--ok); } .badge.bad { background: var(--bad-bg); color: var(--bad); }
+.badge.warn { background: var(--warn-bg); color: var(--warn); } .badge.accent { background: var(--accent); color: #fff; }
+dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 0; font-size: 12px; }
+dt { color: var(--muted); } dd { margin: 0; font-family: var(--mono); word-break: break-all; }
+
+.timeline { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; max-height: 520px; overflow: auto; }
+.timeline .row { display: grid; grid-template-columns: 74px 1fr; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--line); font-size: 12px; }
+.timeline .row:last-child { border-bottom: 0; }
+.timeline .t { color: var(--muted); font-family: var(--mono); }
+.timeline .svc { font-family: var(--mono); font-weight: 600; }
+.timeline .empty { padding: 12px; color: var(--muted); font-size: 12px; }
+
+.logs { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; display: flex; flex-direction: column; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.toolbar input[type=search] { flex: 1 1 200px; min-width: 140px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); color: var(--text); font: inherit; }
+.toolbar button, .chip { font: inherit; font-size: 12px; padding: 3px 9px; border-radius: 12px; border: 1px solid var(--line);
+  background: var(--bg); color: var(--text); cursor: pointer; }
+.chip.off { opacity: .4; text-decoration: line-through; }
+.toolbar label { font-size: 12px; color: var(--muted); display: flex; gap: 4px; align-items: center; }
+#log { height: 460px; overflow: auto; font-family: var(--mono); font-size: 12px; background: var(--log-bg); padding: 4px 0; }
+.ln { display: grid; grid-template-columns: 92px 130px 1fr; gap: 8px; padding: 1px 10px; white-space: pre-wrap; word-break: break-word; }
+.ln:hover { background: var(--off-bg); }
+.ln .t { color: var(--muted); }
+.ln .svc { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ln.err .msg { color: var(--bad); } .ln.warnl .msg { color: var(--warn); }
+.ln.event { background: var(--off-bg); } .ln.event .msg { font-weight: 600; }
+.ln.change { background: color-mix(in srgb, var(--accent) 12%, transparent); } .ln.change .msg { font-weight: 600; }
+
+@media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+@media (max-width: 600px) {
+  main, header { padding-left: 16px; padding-right: 16px; }
+  .ln { grid-template-columns: 70px 1fr; } .ln .svc { grid-column: 2; } .ln .msg { grid-column: 1 / -1; }
+}
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="conn"></span>
+  <h1>Resec Observer</h1>
+  <span class="meta" id="meta">connecting…</span>
+  <span class="spacer"></span>
+  <span class="meta">refresh 1s</span>
+</header>
+
+<main>
+  <section>
+    <h2>Cluster</h2>
+    <div class="summary" id="summary"></div>
+  </section>
+
+  <section>
+    <h2>Scenarios <span class="meta" id="resultsMeta"></span></h2>
+    <div class="scenarios" id="scenarios"><div class="empty">No test run yet. Run demo/scenario.sh.</div></div>
+  </section>
+
+  <div class="cols">
+    <div style="display:grid; gap:16px">
+      <section>
+        <h2>Consul servers</h2>
+        <div class="servers" id="servers"></div>
+      </section>
+      <section>
+        <h2>Nodes</h2>
+        <div class="nodes" id="nodes"></div>
+      </section>
+    </div>
+    <section>
+      <h2>State changes</h2>
+      <div class="timeline" id="timeline"><div class="empty">No changes yet.</div></div>
+    </section>
+  </div>
+
+  <section>
+    <h2>Log flow</h2>
+    <div class="logs">
+      <div class="toolbar">
+        <input type="search" id="filter" placeholder="Filter text (regex)">
+        <span id="chips"></span>
+        <label><input type="checkbox" id="onlyImportant"> warn/error only</label>
+        <label><input type="checkbox" id="follow" checked> follow</label>
+        <button id="clear">Clear</button>
+      </div>
+      <div id="log"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const time = (iso) => iso ? new Date(iso).toLocaleTimeString([], {hour12:false}) + "." + String(new Date(iso).getMilliseconds()).padStart(3,"0") : "";
+
+// ------------------------------------------------------------ status
+
+function badge(text, cls) { return `<span class="badge ${cls||""}">${esc(text)}</span>`; }
+function tile(k, v, s, cls) { return `<div class="tile ${cls||""}"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div>${s?`<div class="s">${esc(s)}</div>`:""}</div>`; }
+function dl(pairs) { return "<dl>" + pairs.filter(p => p[1] !== undefined && p[1] !== null && p[1] !== "").map(([k,v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("") + "</dl>"; }
+function card(name, kind, container, statusBadge, body) {
+  const down = !container || container.state !== "running";
+  const cb = down ? badge(container ? container.state : "missing", "bad") : "";
+  return `<div class="card ${down?"down":""}"><div class="head"><span class="name">${esc(name)}</span>${cb}${down?"":statusBadge}<span class="kind">${esc(kind)}</span></div>${body||""}</div>`;
+}
+
+function render(st) {
+  const cont = Object.fromEntries((st.containers||[]).map(c => [c.service, c]));
+  const P = st.probes || {}, C = st.cluster || {}, G = st.groups || {};
+
+  // summary
+  const tiles = [];
+  tiles.push(tile("Consul quorum", C.quorum ? "OK" : "LOST", C.quorum ? `via ${C.via||"?"}` : (C.quorum_error||"no agent reachable"), C.quorum ? "ok" : "bad"));
+  const lock = C.lock;
+  tiles.push(tile("Lock holder", lock && lock.node ? lock.node : (lock && lock.missing ? "key missing" : "none"),
+    lock && lock.session ? `session ${lock.session.slice(0,8)}` : "", lock && lock.node ? "ok" : "warn"));
+  const masters = (C.catalog||{}).master || [];
+  const mPass = masters.filter(m => m.status === "passing");
+  tiles.push(tile("Catalog master", masters.length ? masters.map(m => `${m.address}:${m.port}`).join(", ") : "none",
+    masters.length ? masters.map(m => `${m.node} ${m.status}`).join(", ") : "", mPass.length === 1 && masters.length === 1 ? "ok" : (masters.length > 1 ? "bad" : "warn")));
+  const redisMasters = Object.entries(P.redis||{}).filter(([,r]) => r.role === "master").map(([n]) => n);
+  tiles.push(tile("Redis masters", String(redisMasters.length), redisMasters.join(", "), redisMasters.length === 1 ? "ok" : "bad"));
+  for (const n of G.resec||[]) {
+    const r = (P.resec||{})[n];
+    const ok = r && r.health_code === 200;
+    tiles.push(tile(`${n} /health`, r ? (r.health_code || "down") : (cont[n]?.state || "down"), r ? r.health : "", ok ? "ok" : "bad"));
+  }
+  $("summary").innerHTML = tiles.join("");
+
+  // consul servers
+  const leaderAddrs = new Set(Object.values(P.consul_server||{}).map(s => s.leader).filter(Boolean));
+  $("servers").innerHTML = (G.consul_server||[]).map(n => {
+    const s = (P.consul_server||{})[n];
+    let b = "";
+    if (s && s.ok) {
+      const isLeader = s.raft_state === "Leader";
+      b = isLeader ? badge("leader","accent") : (s.leader ? badge(s.raft_state?.toLowerCase()||"follower","ok") : badge("no leader","bad"));
+    } else if (s) b = badge("unreachable","bad");
+    const body = s && s.ok ? dl([["node", esc(s.node)], ["addr", esc(s.addr)], ["raft", esc(s.raft_state)], ["sees leader", esc(s.leader || "—")]])
+                           : (s ? dl([["error", esc(s.error)]]) : "");
+    return card(n, "consul server", cont[n], b, body);
+  }).join("");
+
+  // nodes: group agent/redis/resec by trailing number
+  const byNode = {};
+  const add = (n, kind) => { const m = n.match(/(\d+)$/); const k = m ? m[1] : n; (byNode[k] ||= {})[kind] = n; };
+  (G.consul_agent||[]).forEach(n => add(n, "agent")); (G.redis||[]).forEach(n => add(n, "redis")); (G.resec||[]).forEach(n => add(n, "resec"));
+  $("nodes").innerHTML = Object.keys(byNode).sort().map(k => {
+    const g = byNode[k]; let html = `<div class="node"><div class="title">Node ${esc(k)}</div>`;
+    if (g.resec) {
+      const r = (P.resec||{})[g.resec];
+      let b = "", body = "";
+      if (r) {
+        b = r.health_code === 200 ? badge("healthy","ok") : badge(`health ${r.health_code||"down"}`,"bad");
+        const c = r.consul || {}, rd = r.redis || {};
+        body = dl([
+          ["/health", esc(r.health)],
+          ["lock", c.Master === undefined ? "?" : (c.Master ? badge("HOLDER","accent") : "no")],
+          ["consul", c.Healthy === undefined ? esc(r.state_error) : (c.Healthy ? badge("healthy","ok") : badge("not healthy","bad"))],
+          ["master addr", esc(c.MasterAddr ? `${c.MasterAddr}:${c.MasterPort}` : "—")],
+          ["multi-master", (c.MasterServices||[]).length > 1 ? badge(`${c.MasterServices.length} masters`,"bad") : undefined],
+          ["redis view", esc(rd.Role ? `${rd.Role}${rd.Healthy?"":" (unhealthy)"}` : "")],
+        ]);
+      }
+      html += card(g.resec, "resec", cont[g.resec], b, body);
+    }
+    if (g.redis) {
+      const r = (P.redis||{})[g.redis];
+      let b = "", body = "";
+      if (r && r.ok) {
+        const linkBad = r.role === "slave" && r.master_link_status !== "up";
+        b = r.role === "master" ? badge("master","accent") : badge(`slave${linkBad?" · link down":""}`, linkBad ? "bad" : "ok");
+        body = dl(r.role === "master"
+          ? [["slaves", esc(r.connected_slaves)], ["offset", esc(r.offset)]]
+          : [["master", esc(`${r.master_host}:${r.master_port}`)], ["link", esc(r.master_link_status)],
+             ["down since", r.master_link_status !== "up" ? esc((r.master_link_down_since_seconds||"?") + "s") : undefined], ["offset", esc(r.offset)]]);
+      } else if (r) { b = badge("unreachable","bad"); body = dl([["error", esc(r.error)]]); }
+      html += card(g.redis, "redis", cont[g.redis], b, body);
+    }
+    if (g.agent) {
+      const a = (P.consul_agent||{})[g.agent];
+      let b = "", body = "";
+      if (a && a.ok) {
+        b = badge("up","ok");
+        const checks = Object.fromEntries((a.checks||[]).map(c => [c.id, c.status]));
+        body = dl((a.services||[]).map(s => {
+          const st = Object.entries(checks).find(([id]) => id.startsWith(s.id))?.[1];
+          return [s.name, `${esc(s.id)} ${st ? badge(st, st==="passing"?"ok":st==="warning"?"warn":"bad") : ""}`];
+        }).concat([["node", esc(a.node)]]));
+      } else if (a) { b = badge("unreachable","bad"); body = dl([["error", esc(a.error)]]); }
+      html += card(g.agent, "consul agent", cont[g.agent], b, body);
+    }
+    return html + "</div>";
+  }).join("");
+
+  $("meta").textContent = `project ${st.project||"?"} · updated ${time(st.ts)}`;
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/api/status", {cache: "no-store"});
+    const st = await r.json();
+    if (st.ts) render(st);
+    $("conn").className = "dot ok";
+  } catch (e) {
+    $("conn").className = "dot bad";
+    $("meta").textContent = "observer not reachable";
+  }
+  setTimeout(poll, 1000);
+}
+poll();
+
+const RESULT_CLS = {passing: "ok", failing: "bad", running: "warn", pending: ""};
+async function pollResults() {
+  try {
+    const r = await fetch("/api/results", {cache: "no-store"});
+    const res = await r.json();
+    const list = res.scenarios || [];
+    if (list.length) {
+      const open = new Set([...document.querySelectorAll(".scenario[open]")].map(d => d.dataset.id));
+      $("scenarios").innerHTML = list.map(sc => {
+        const fails = sc.checks.filter(c => !c.ok).length;
+        const isOpen = open.has(sc.id) || (sc.status === "failing" && !document.querySelector(`.scenario[data-id="${sc.id}"]`));
+        const items = sc.checks.map(c => `<li class="${c.ok ? "" : "fail"}">${c.ok ? "PASS" : "FAIL"} ${esc(c.text)}</li>`).join("");
+        return `<details class="scenario" data-id="${esc(sc.id)}" ${isOpen ? "open" : ""}><summary>${badge(sc.status, RESULT_CLS[sc.status])}<span>${esc(sc.title)}</span><span class="count">${sc.checks.length} checks, ${fails} failed</span></summary><ul>${items || "<li>no checks yet</li>"}</ul></details>`;
+      }).join("");
+      $("resultsMeta").textContent = res.updated ? `updated ${res.updated}` : "";
+    }
+  } catch (e) { /* keep the last result */ }
+  setTimeout(pollResults, 2000);
+}
+pollResults();
+
+// ------------------------------------------------------------ logs
+
+const MAX_LINES = 4000;
+const lines = [];
+const hidden = new Set();
+const palette = ["#3d5afe","#00897b","#8e24aa","#ef6c00","#2e7d32","#c2185b","#0277bd","#6d4c41","#5e35b1","#00838f"];
+const colors = {};
+const colorOf = (svc) => colors[svc] ||= palette[Object.keys(colors).length % palette.length];
+
+function classify(it) {
+  if (it.kind === "event") return "event";
+  if (it.kind === "change") return "change";
+  const l = it.line;
+  if (/level=(error|fatal)|\[ERR|\bERROR\b|\bpanic\b/i.test(l) || it.kind === "stderr" && !/level=/.test(l) && /error/i.test(l)) return "err";
+  if (/level=warn|\[WARN|\bWARN(ING)?\b/i.test(l)) return "warnl";
+  return "";
+}
+
+function matches(it) {
+  if (hidden.has(it.svc)) return false;
+  if ($("onlyImportant").checked && !["err","warnl","event","change"].includes(it.cls)) return false;
+  const f = $("filter").value.trim();
+  if (f) { try { if (!new RegExp(f, "i").test(it.svc + " " + it.line)) return false; } catch { if (!(it.svc + " " + it.line).toLowerCase().includes(f.toLowerCase())) return false; } }
+  return true;
+}
+
+function lineEl(it) {
+  const d = document.createElement("div");
+  d.className = "ln " + it.cls;
+  d.innerHTML = `<span class="t">${esc(time(it.ts))}</span><span class="svc" style="color:${colorOf(it.svc)}">${esc(it.svc)}</span><span class="msg">${esc(it.line)}</span>`;
+  return d;
+}
+
+function redraw() {
+  const box = $("log"); box.textContent = "";
+  const frag = document.createDocumentFragment();
+  for (const it of lines) if (matches(it)) frag.appendChild(lineEl(it));
+  box.appendChild(frag);
+  if ($("follow").checked) box.scrollTop = box.scrollHeight;
+}
+
+function renderChips() {
+  const svcs = Object.keys(colors).sort();
+  $("chips").innerHTML = svcs.map(s => `<button class="chip ${hidden.has(s)?"off":""}" data-svc="${esc(s)}" style="border-color:${colorOf(s)}">${esc(s)}</button>`).join(" ");
+}
+$("chips").addEventListener("click", e => {
+  const s = e.target.dataset?.svc; if (!s) return;
+  hidden.has(s) ? hidden.delete(s) : hidden.add(s); renderChips(); redraw();
+});
+
+const timeline = [];
+function addTimeline(it) {
+  timeline.unshift(it); if (timeline.length > 200) timeline.pop();
+  $("timeline").innerHTML = timeline.map(t => `<div class="row"><span class="t">${esc(time(t.ts).slice(0,8))}</span><span><span class="svc" style="color:${colorOf(t.svc)}">${esc(t.svc)}</span> ${esc(t.line)}</span></div>`).join("");
+}
+
+function onItems(items) {
+  const box = $("log");
+  const known = Object.keys(colors).length;
+  const frag = document.createDocumentFragment();
+  for (const it of items) {
+    it.cls = classify(it); colorOf(it.svc);
+    lines.push(it);
+    if (it.kind === "change" || it.kind === "event") addTimeline(it);
+    if (matches(it)) frag.appendChild(lineEl(it));
+  }
+  box.appendChild(frag);
+  if (lines.length > MAX_LINES) {
+    lines.splice(0, lines.length - MAX_LINES);
+    while (box.childElementCount > MAX_LINES) box.firstChild.remove();
+  }
+  if (Object.keys(colors).length !== known) renderChips();
+  if ($("follow").checked) box.scrollTop = box.scrollHeight;
+}
+
+const es = new EventSource("/api/logs");
+es.onmessage = (e) => onItems(JSON.parse(e.data));
+
+$("filter").addEventListener("input", redraw);
+$("onlyImportant").addEventListener("change", redraw);
+$("clear").addEventListener("click", () => { lines.length = 0; redraw(); });
+$("log").addEventListener("wheel", (e) => { if (e.deltaY < 0) $("follow").checked = false; });
+</script>
+</body>
+</html>

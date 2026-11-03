@@ -1,7 +1,9 @@
 package reconciler
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -14,6 +16,7 @@ import (
 	"github.com/aireuropa/resec/resec/state"
 	"github.com/bep/debounce"
 	log "github.com/sirupsen/logrus"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 	"gopkg.in/d4l3k/messagediff.v1"
 )
 
@@ -50,6 +53,18 @@ type Reconciler struct {
 	stopCh                 chan interface{}      // stop channel (internal shutdown)
 	stateServerOn          bool                  // activate the state server?
 	stateListenAddress     string                // address:port for status server
+	httpServer             *http.Server          // state server (nil if not active)
+
+	consulHealth         func(context.Context) error // live Consul check used by /health
+	consulHealthTimeout  time.Duration               // timeout for the live Consul check
+	consulHealthFailures int                         // consecutive failed Consul checks before /health fails
+	consulHealthFailed   int                         // current number of consecutive failed Consul checks
+	consulHealthMu       sync.Mutex                  // protects consulHealthFailed
+
+	announceHost string // host announced to Consul (empty when only the port is announced)
+	announcePort int    // port announced to Consul
+	redisHost    string // host from REDIS_ADDR, used when announceHost is empty
+
 	sync.Mutex
 }
 
@@ -88,7 +103,8 @@ func (r *Reconciler) Run() {
 
 	// Start the state server
 	if r.stateServerOn {
-		go r.stateServer()
+		r.httpServer = r.newStateServer()
+		go r.serveState(r.httpServer)
 	}
 
 	for {
@@ -101,8 +117,11 @@ func (r *Reconciler) Run() {
 
 		case sig := <-r.debugSignalCh:
 			if sig == syscall.SIGUSR1 {
-				r.logger.WithField("dump_state", "consul").Warn(r.prettyPrint(r.consulState))
-				r.logger.WithField("dump_state", "redis").Warn(r.prettyPrint(r.redisState))
+				r.Lock()
+				consulState, redisState := r.consulState, r.redisState
+				r.Unlock()
+				r.logger.WithField("dump_state", "consul").Warn(r.prettyPrint(consulState))
+				r.logger.WithField("dump_state", "redis").Warn(r.prettyPrint(redisState))
 			}
 
 			if sig == syscall.SIGUSR2 {
@@ -147,6 +166,9 @@ func (r *Reconciler) Run() {
 }
 
 func (r *Reconciler) apply(state resultType) {
+	span := tracer.StartSpan("resec.apply", tracer.ResourceName(string(state)))
+	defer span.Finish()
+
 	switch state {
 	case ResultMissingState:
 		r.logger.Debug("Not ready to reconcile yet, missing initial state")
@@ -190,7 +212,13 @@ func (r *Reconciler) apply(state resultType) {
 	}
 }
 
-func (r *Reconciler) evaluate() resultType {
+func (r *Reconciler) evaluate() (result resultType) {
+	span := tracer.StartSpan("resec.evaluate")
+	defer func() {
+		span.SetTag("result", string(result))
+		span.Finish()
+	}()
+
 	// Make sure the state doesn't change half-way through our evaluation
 	r.Lock()
 	defer r.Unlock()
@@ -234,6 +262,12 @@ func (r *Reconciler) evaluate() resultType {
 	if r.consulState.IsSlave() {
 		// can't enslave if there are no known master redis in consul catalog
 		if r.consulState.NoMasterElected() {
+			return ResultNoMasterElected
+		}
+
+		// the catalog can still list our own service as master after we
+		// lost the lock, never enslave Redis to its own address
+		if r.masterIsSelf() {
 			return ResultNoMasterElected
 		}
 
@@ -285,38 +319,96 @@ func (r *Reconciler) overviewPage() string {
 	return o
 }
 
-func (r *Reconciler) stateServer() {
-	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+// checkConsulHealth does the live Consul check. It returns an error only
+// after consulHealthFailures consecutive failed checks.
+func (r *Reconciler) checkConsulHealth(ctx context.Context) error {
+	if r.consulHealth == nil {
+		return nil
+	}
+
+	err := r.consulHealth(ctx)
+
+	r.consulHealthMu.Lock()
+	defer r.consulHealthMu.Unlock()
+
+	if err == nil {
+		r.consulHealthFailed = 0
+		return nil
+	}
+
+	r.consulHealthFailed++
+	if r.consulHealthFailed < r.consulHealthFailures {
+		r.logger.Warnf("health: consul check failed (%d/%d): %v", r.consulHealthFailed, r.consulHealthFailures, err)
+		return nil
+	}
+
+	return err
+}
+
+// newStateServer creates the HTTP state server
+func (r *Reconciler) newStateServer() *http.Server {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != "/" {
 			http.NotFound(w, req)
 			return
 		}
-		w.Write([]byte(r.overviewPage()))
+		r.Lock()
+		page := r.overviewPage()
+		r.Unlock()
+		w.Write([]byte(page))
 	})
 
-	http.HandleFunc("/state", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("/state", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		jData, _ := r.MarshalJSON()
 		w.Write(jData)
 	})
 
-	http.HandleFunc("/info", func(w http.ResponseWriter, req *http.Request) {
-		fmt.Fprint(w, r.redisState.InfoString)
+	mux.HandleFunc("/info", func(w http.ResponseWriter, req *http.Request) {
+		r.Lock()
+		info := r.redisState.InfoString
+		r.Unlock()
+		fmt.Fprint(w, info)
 	})
 
-	http.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
-		if r.redisState.IsReadyToServe() {
-			w.Write([]byte("ok"))
-		} else {
+	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
+		ctx, cancel := context.WithTimeout(req.Context(), r.consulHealthTimeout)
+		defer cancel()
+
+		if err := r.checkConsulHealth(ctx); err != nil {
+			r.logger.Warnf("health: consul check failed: %v", err)
 			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte("fail"))
+			fmt.Fprintf(w, "fail: consul: %v", err)
+			return
 		}
+
+		r.Lock()
+		ready := r.redisState.IsReadyToServe()
+		r.Unlock()
+
+		if !ready {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("fail: redis not ready"))
+			return
+		}
+		w.Write([]byte("ok"))
 	})
 
-	r.logger.Info("Starting state server at ", r.stateListenAddress)
+	return &http.Server{
+		Addr:              r.stateListenAddress,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+}
 
-	if err := http.ListenAndServe(r.stateListenAddress, nil); err != nil {
-		r.logger.Fatal(err)
+// serveState runs the state server. An error does not stop resec.
+func (r *Reconciler) serveState(server *http.Server) {
+	r.logger.Info("Starting state server at ", server.Addr)
+
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		r.logger.Errorf("State server stopped: %v", err)
 	}
 }
 
@@ -340,9 +432,13 @@ func (r *Reconciler) stateReader() {
 			changed := r.diffState(r.redisState, redis)
 			if changed {
 				r.redisState = redis
-				r.reconcileCh <- true
 			}
 			r.Unlock()
+
+			// send after Unlock, evaluate() needs the lock
+			if changed {
+				r.reconcileCh <- true
+			}
 
 		// New Consul state change
 		case consul, ok := <-r.consulStateCh:
@@ -356,9 +452,13 @@ func (r *Reconciler) stateReader() {
 			changed := r.diffState(r.consulState, consul)
 			if changed {
 				r.consulState = consul
-				r.reconcileCh <- true
 			}
 			r.Unlock()
+
+			// send after Unlock, evaluate() needs the lock
+			if changed {
+				r.reconcileCh <- true
+			}
 		}
 	}
 }
@@ -397,6 +497,20 @@ func (r *Reconciler) missingInitialState() bool {
 	}
 
 	return false
+}
+
+// masterIsSelf returns true when the master address in Consul is our own address
+func (r *Reconciler) masterIsSelf() bool {
+	if r.announcePort == 0 || r.consulState.MasterPort != r.announcePort {
+		return false
+	}
+
+	host := r.announceHost
+	if host == "" {
+		host = r.redisHost
+	}
+
+	return host != "" && r.consulState.MasterAddr == host
 }
 
 // notSlaveOfCurrentMaster return wheter the Redis under management currently
@@ -451,12 +565,16 @@ func (r *Reconciler) stop() {
 				r.logger.Fatal("Did not gracefully shut down within 60s, hard quitting")
 
 			case <-intervalCh.C:
-				if r.redisState.Stopped && redisStopped == false {
+				r.Lock()
+				redisDone, consulDone := r.redisState.Stopped, r.consulState.Stopped
+				r.Unlock()
+
+				if redisDone && redisStopped == false {
 					redisStopped = true
 					wg.Done()
 				}
 
-				if r.consulState.Stopped && consulStopped == false {
+				if consulDone && consulStopped == false {
 					consulStopped = true
 					wg.Done()
 				}
@@ -470,6 +588,14 @@ func (r *Reconciler) stop() {
 	}()
 
 	wg.Wait()
+
+	if r.httpServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := r.httpServer.Shutdown(ctx); err != nil {
+			r.logger.Errorf("Could not stop state server: %v", err)
+		}
+		cancel()
+	}
 
 	r.logger.Debugf("Cleanup completed")
 	close(r.stopCh)
@@ -515,6 +641,9 @@ func (r *Reconciler) prettyPrint(data interface{}) string {
 
 // Marshalling to JSON is used when sendnig debug signal to the process
 func (r *Reconciler) MarshalJSON() ([]byte, error) {
+	r.Lock()
+	defer r.Unlock()
+
 	return json.Marshal(map[string]interface{}{
 		"consulState":            r.consulState,
 		"forceReconcileInterval": r.forceReconcileInterval,

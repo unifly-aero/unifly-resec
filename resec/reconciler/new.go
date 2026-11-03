@@ -1,6 +1,7 @@
 package reconciler
 
 import (
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -34,6 +35,18 @@ func NewReconciler(c *cli.Context) (*Reconciler, error) {
 		stopCh:                 make(chan interface{}, 1),
 		stateServerOn:          c.Bool("state-server"),
 		stateListenAddress:     c.String("state-listen-addr"),
+		consulHealth:           consulConnection.LockKeyHealthy,
+		consulHealthTimeout:    c.Duration("health-consul-timeout"),
+		consulHealthFailures:   c.Int("health-consul-failures"),
+	}
+
+	reconciler.announceHost, reconciler.announcePort = consulConnection.AnnounceAddr()
+	if host, _, err := net.SplitHostPort(redisConnection.Config().Address); err == nil {
+		reconciler.redisHost = host
+	}
+
+	if reconciler.consulHealthFailures < 1 {
+		reconciler.consulHealthFailures = 1
 	}
 
 	signal.Notify(reconciler.signalCh, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGINT)

@@ -52,7 +52,14 @@ With this you can access the internal states of resec and the info output of the
 /health  health check
 ```
 
-Additionally, an healthcheck endpoint is exposed under `/health`. It switches from "fail"/503 to "ok"/200 after the redis instance is synced with the cluster and ready to serve.
+Additionally, an healthcheck endpoint is exposed under `/health`. It returns "ok"/200 only when both conditions are true:
+
+1. A live, consistent read of the lock key (`CONSUL_LOCK_KEY`) in Consul KV succeeds and the key exists. If the Consul agent is down or the Consul servers have no leader (no quorum), `/health` returns `fail: consul: ...`/503.
+2. The redis instance is synced with the cluster and ready to serve. If not, `/health` returns `fail: redis not ready`/503.
+
+When Consul is not healthy, resec does not change the Redis topology. A master stays master and a slave stays slave until Consul is healthy again.
+
+The lock key does not exist before the first lock is acquired. With Nomad, set `check_restart { grace = "30s" }` so that the first health check does not restart the task.
 This can be used for deployment automation. See [examples](./example) for a Nomadconfig that uses this.
 
 ## Usage
@@ -68,7 +75,7 @@ CONSUL_SERVICE_NAME   |                | Consul service name for tag based servi
 CONSUL_SERVICE_PREFIX | redis          | Name Prefix, will be followed by "-(master/slave)", ignored if CONSUL_SERVICE_NAME is used
 CONSUL_LOCK_KEY       | resec/.lock    | KV lock location, should be overriden if multiple instances running in the same consul DC
 CONSUL_LOCK_SESSION_NAME       | resec | Lock session Name to distinguish multiple resec masters on one host
-CONSUL_LOCK_MONITOR_RETRIES | 3        | Number of retries of lock receives 500 Error from Consul
+CONSUL_LOCK_MONITOR_RETRIES | 30       | Number of retries of lock receives 500 Error from Consul. `RETRIES * RETRY_INTERVAL` must not be more than `2 * CONSUL_LOCK_TTL`
 CONSUL_LOCK_MONITOR_RETRY_INTERVAL | 1s | Retry interval if lock receives 500 Error from Consul
 CONSUL_DEREGISTER_SERVICE_AFTER | 72h  |
 CONSUL_LOCK_TTL       | 15s            |
@@ -76,6 +83,8 @@ MASTER_TAGS           |                | Comma separated list of tags to be adde
 SLAVE_TAGS            |                | Comma separated list of tags to be added to slave instance. The first tag (index 0) is used to configure the role of the Redis/resec task, and *must* be different from index 0 in `MASTER_TAGS`.
 HEALTHCHECK_INTERVAL  | 5s             |
 HEALTHCHECK_TIMEOUT   | 2s             |
+HEALTH_CONSUL_TIMEOUT | 2s             | Timeout for the Consul KV read done by `/health`. Keep it below the timeout of the external health check
+HEALTH_CONSUL_FAILURES | 1             | Number of consecutive failed Consul KV reads before `/health` fails
 REDIS_ADDR            | 127.0.0.1:6379 |
 REDIS_PASSWORD        |                |
 STATE_SERVER          | False          | Activates simple web server for internal state and health check

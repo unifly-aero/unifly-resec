@@ -280,3 +280,49 @@ func TestReconciler_SlaveMasterLinkDownWithinReason(t *testing.T) {
 		).
 		eval(ResultUpdateService)
 }
+
+func TestReconciler_SlaveMasterIsSelf(t *testing.T) {
+	helper := newTestReconciler(t)
+	helper.reconciler.announceHost = "redis-resec-2"
+	helper.reconciler.announcePort = 6379
+	helper.consume()
+	defer helper.stop()
+
+	// the lock is lost but the catalog still lists our own service as master,
+	// Redis must not be enslaved to its own address
+	helper.
+		withConsulState(state.Consul{
+			Ready:      true,
+			Healthy:    true,
+			Master:     false,
+			MasterAddr: "redis-resec-2",
+			MasterPort: 6379,
+		}).
+		withRedisState(state.Redis{
+			Ready:   true,
+			Healthy: true,
+			Info:    state.RedisStatus{Role: "master"},
+		}).
+		eval(ResultNoMasterElected)
+}
+
+func TestReconciler_SlaveMasterIsSelf_PortOnly(t *testing.T) {
+	helper := newTestReconciler(t)
+	helper.reconciler.announcePort = 6379
+	helper.reconciler.redisHost = "127.0.0.1"
+	helper.consume()
+	defer helper.stop()
+
+	helper.
+		withConsulState(state.Consul{
+			Ready:      true,
+			Healthy:    true,
+			MasterAddr: "127.0.0.1",
+			MasterPort: 6379,
+		}).
+		withRedisState(state.Redis{
+			Ready:   true,
+			Healthy: true,
+		}).
+		eval(ResultNoMasterElected)
+}

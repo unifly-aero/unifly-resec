@@ -54,6 +54,10 @@ func NewConnection(c *cli.Context, redisConfig redis.Config) (*Manager, error) {
 		return nil, fmt.Errorf("Minimum Consul lock session TTL is 15s")
 	}
 
+	if maxWait := time.Duration(consulConfig.lockMonitorRetries) * consulConfig.lockMonitorRetryInterval; maxWait > 2*consulConfig.lockTTL {
+		return nil, fmt.Errorf("consul-lock-monitor-retries * consul-lock-monitor-retry-interval (%s) must not be more than 2 * consul-lock-ttl (%s)", maxWait, 2*consulConfig.lockTTL)
+	}
+
 	announceAddr := c.String("announce-addr")
 	if announceAddr == "" {
 		redisHost := strings.Split(redisConfig.Address, ":")[0]
@@ -87,6 +91,7 @@ func NewConnection(c *cli.Context, redisConfig redis.Config) (*Manager, error) {
 		},
 		clientConfig: consulapi.DefaultConfig(),
 		commandCh:    make(chan Command, 10),
+		lockCh:       make(chan struct{}),
 		config:       consulConfig,
 		logger:       log.WithField("system", "consul"),
 		stateCh:      make(chan state.Consul, 10),

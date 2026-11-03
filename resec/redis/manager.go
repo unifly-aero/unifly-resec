@@ -1,13 +1,14 @@
 package redis
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/aireuropa/resec/resec/state"
-	"github.com/go-redis/redis"
+	"github.com/redis/go-redis/v9"
 )
 
 // emit will send a state update to the reconciler
@@ -17,7 +18,7 @@ func (m *Manager) emit() {
 
 // runAsMaster sets the instance to be the master
 func (m *Manager) runAsMaster() error {
-	if err := m.client.SlaveOf("no", "one").Err(); err != nil {
+	if err := m.client.Do(context.Background(), "REPLICAOF", "NO", "ONE").Err(); err != nil {
 		return err
 	}
 
@@ -30,7 +31,7 @@ func (m *Manager) runAsMaster() error {
 func (m *Manager) runAsSlave(masterAddress string, masterPort int) error {
 	m.logger.Infof("Enslaving redis to be slave of %s:%d", masterAddress, masterPort)
 
-	if err := m.client.SlaveOf(masterAddress, strconv.Itoa(masterPort)).Err(); err != nil {
+	if err := m.client.Do(context.Background(), "REPLICAOF", masterAddress, strconv.Itoa(masterPort)).Err(); err != nil {
 		return fmt.Errorf("Could not enslave redis to be slave of %s:%d (%v)", masterAddress, masterPort, err)
 	}
 
@@ -42,8 +43,9 @@ func (m *Manager) runAsSlave(masterAddress string, masterPort int) error {
 // disconnect all normal connections
 func (m *Manager) disconnectUsers() error {
 	m.logger.Warnf("Disconnecting all clients")
-	cmd := redis.NewIntCmd("CLIENT", "KILL", "TYPE", "normal")
-	m.client.Process(cmd)
+	ctx := context.Background()
+	cmd := redis.NewIntCmd(ctx, "CLIENT", "KILL", "TYPE", "normal")
+	m.client.Process(ctx, cmd)
 	if err := cmd.Err(); err != nil {
 		return err
 	}
@@ -123,7 +125,7 @@ func (m *Manager) watchStatus() {
 	for {
 		select {
 		case <-timer.C:
-			result, err := m.client.Info().Result()
+			result, err := m.client.Info(context.Background()).Result()
 			// any failure will trigger a disconnect event
 			if err != nil {
 				m.state.Healthy = false
@@ -227,7 +229,8 @@ func (m *Manager) parseKeyValue(str string) map[string]string {
 			continue
 		}
 
-		pair := strings.Split(line, ":")
+		// SplitN keeps values with ':' (for example IPv6 master_host)
+		pair := strings.SplitN(line, ":", 2)
 		if len(pair) != 2 {
 			continue
 		}

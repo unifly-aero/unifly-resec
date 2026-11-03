@@ -1,6 +1,10 @@
 package consul
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -10,7 +14,56 @@ import (
 
 // emit will emit a consul state change to the reconciler
 func (m *Manager) emit() {
-	m.stateCh <- *m.state
+	m.mu.Lock()
+	snapshot := m.copyState()
+	m.mu.Unlock()
+
+	m.stateCh <- snapshot
+}
+
+// copyState returns a deep copy of the state. The caller must hold m.mu.
+func (m *Manager) copyState() state.Consul {
+	s := *m.state
+	if m.state.MasterServices != nil {
+		s.MasterServices = append([]state.ConsulService(nil), m.state.MasterServices...)
+	}
+	return s
+}
+
+// update changes the state under the lock and emits the new state
+func (m *Manager) update(fn func(s *state.Consul)) {
+	m.mu.Lock()
+	fn(m.state)
+	snapshot := m.copyState()
+	m.mu.Unlock()
+
+	m.stateCh <- snapshot
+}
+
+// snapshot returns a copy of the current state
+func (m *Manager) snapshot() state.Consul {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.copyState()
+}
+
+// LockKeyHealthy does a live KV read of the lock key.
+// It returns an error if Consul has no leader, the agent is down,
+// or the key does not exist.
+func (m *Manager) LockKeyHealthy(ctx context.Context) error {
+	q := (&consulapi.QueryOptions{RequireConsistent: true}).WithContext(ctx)
+	pair, _, err := m.client.KVGet(m.config.lockKey, q)
+	if err != nil {
+		return fmt.Errorf("consul kv get %q: %w", m.config.lockKey, err)
+	}
+
+	// a consistent read needs a Consul leader
+	m.markConsulHealthy()
+
+	if pair == nil {
+		return fmt.Errorf("consul kv key %q not found", m.config.lockKey)
+	}
+	return nil
 }
 
 // cleanup will do cleanup tasks when the reconciler is shutting down
@@ -22,10 +75,42 @@ func (m *Manager) cleanup() {
 	m.deregisterService()
 
 	m.logger.Debug("Closing stopCh")
+	m.lockChOnce.Do(func() { close(m.lockCh) })
 	close(m.stopCh)
 
-	m.state.Stopped = true
-	m.emit()
+	m.update(func(s *state.Consul) { s.Stopped = true })
+}
+
+// AnnounceAddr returns the host and port announced to Consul.
+// The host is empty when only the port is announced.
+func (m *Manager) AnnounceAddr() (host string, port int) {
+	return m.config.announceHost, m.config.announcePort
+}
+
+// watchConsulRecovery does a consistent KV read of the lock key while
+// Consul is not healthy. A slave can wait inside Lock() for a long time,
+// this read lets Healthy return to true without a lock acquisition.
+func (m *Manager) watchConsulRecovery() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.stopCh:
+			return
+
+		case <-ticker.C:
+			if m.snapshot().Healthy {
+				continue
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := m.LockKeyHealthy(ctx); err != nil {
+				m.logger.Debugf("Consul recovery check failed: %v", err)
+			}
+			cancel()
+		}
+	}
 }
 
 // continuouslyAcquireConsulLeadership waits to acquire the lock to the Consul KV key.
@@ -33,6 +118,8 @@ func (m *Manager) cleanup() {
 func (m *Manager) continuouslyAcquireConsulLeadership() {
 	interval := 250 * time.Millisecond
 	timer := time.NewTimer(interval)
+
+	go m.watchConsulRecovery()
 
 	for {
 		select {
@@ -45,7 +132,7 @@ func (m *Manager) continuouslyAcquireConsulLeadership() {
 			m.acquireConsulLeadership()
 
 			// if we are not healthy, apply exponential backoff
-			if m.state.Healthy == false {
+			if !m.snapshot().Healthy {
 				backoffDuration := m.backoff.Duration()
 				m.logger.Errorf("Consul is not healthy, going to apply backoff of %s until next attempt", backoffDuration.Round(time.Second).String())
 				timer.Reset(backoffDuration)
@@ -61,7 +148,7 @@ func (m *Manager) continuouslyAcquireConsulLeadership() {
 // redis Master node
 func (m *Manager) acquireConsulLeadership() {
 	// if we already hold the lock, we can't acquire it again
-	if m.state.Master {
+	if m.snapshot().Master {
 		m.logger.Debug("We already hold the lock, can't acquire it again")
 		return
 	}
@@ -97,17 +184,26 @@ func (m *Manager) acquireConsulLeadership() {
 			return
 		}
 
-		m.logger.Info("Lock successfully acquired")
+		// Lock() returns (nil, nil) when lockCh is closed (shutdown)
+		if m.lockErrorCh == nil {
+			m.logger.Debug("Lock attempt aborted")
+			return
+		}
 
-		m.state.Master = true
-		m.emit()
+		m.logger.Info("Lock successfully acquired")
+		m.markConsulHealthy()
 	}
 
 	//
 	// start monitoring the consul lock for errors / changes
 	//
 
-	m.config.voluntarilyReleaseLockCh = make(chan interface{})
+	releaseCh := make(chan interface{})
+
+	m.update(func(s *state.Consul) {
+		s.Master = true
+		m.config.voluntarilyReleaseLockCh = releaseCh
+	})
 
 	// At this point, if we return from this function, we need to make sure
 	// we release the lock
@@ -120,8 +216,14 @@ func (m *Manager) acquireConsulLeadership() {
 			m.logger.Info("Consul Lock successfully released")
 		}
 
-		m.state.Master = false
-		m.emit()
+		m.update(func(s *state.Consul) {
+			s.Master = false
+			// the catalog can still list us as master until the TTL
+			// check expires, clear the address so the watch reloads it
+			s.MasterAddr = ""
+			s.MasterPort = 0
+			m.config.voluntarilyReleaseLockCh = nil
+		})
 	}()
 
 	// Wait for changes to Consul Lock
@@ -143,7 +245,7 @@ func (m *Manager) acquireConsulLeadership() {
 			m.logger.Warnf("Something wrote to lock error channel %+v", data)
 
 		// voluntarily release our claim on the lock
-		case <-m.config.voluntarilyReleaseLockCh:
+		case <-releaseCh:
 			m.logger.Warnf("Voluntarily releasing the Consul lock")
 			return
 		}
@@ -152,19 +254,24 @@ func (m *Manager) acquireConsulLeadership() {
 
 // releaseConsulLock stops consul lock handler")
 func (m *Manager) releaseConsulLock() {
-	if m.state.Master == false {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.state.Master || m.config.voluntarilyReleaseLockCh == nil {
 		m.logger.Debug("Can't release Consul lock, we don't have it")
 		return
 	}
 
 	m.logger.Info("Releasing Consul lock")
 	close(m.config.voluntarilyReleaseLockCh)
+	// prevent a second close before the lock goroutine has cleaned up
+	m.config.voluntarilyReleaseLockCh = nil
 }
 
 // getReplicationStatus will return current replication status
 // the default value is 'slave' - only if we hold the lock will 'master' be returned
 func (m *Manager) getReplicationStatus() string {
-	if m.state.Master {
+	if m.snapshot().Master {
 		return "master"
 	}
 
@@ -243,7 +350,7 @@ func (m *Manager) registerService(redisState state.Redis) {
 
 // deregisterService will deregister the consul service from Consul catalog
 func (m *Manager) deregisterService() {
-	if m.state.Healthy && m.config.serviceID != "" {
+	if m.snapshot().Healthy && m.config.serviceID != "" {
 		err := m.client.ServiceDeregister(m.config.serviceID)
 		m.handleConsulError(err)
 	}
@@ -252,15 +359,51 @@ func (m *Manager) deregisterService() {
 	m.config.checkID = ""
 }
 
-// deregisterService will deregister the consul service from Consul catalog
-func (m *Manager) deregisterMultiMasterService(redisState state.Redis) {
-	for _, service := range m.state.MasterServices {
-		// TODO only deregister the wrong one
-		m.logger.Info("Deregistering %s:%d, %s", service.Address, service.Port, service.ServiceID)
-		err := m.client.ServiceDeregister(service.ServiceID)
-		m.handleConsulError(err)
+// localNodeName returns the name of the local Consul agent node
+func (m *Manager) localNodeName() (string, error) {
+	if m.config.nodeName != "" {
+		return m.config.nodeName, nil
 	}
 
+	name, err := m.client.NodeName()
+	if err != nil {
+		return "", err
+	}
+
+	m.config.nodeName = name
+	return name, nil
+}
+
+// deregisterMultiMasterService removes the wrong master services when
+// more than one master service is found in the Consul catalog.
+//
+// If this node holds the lock, it keeps its own service and removes the
+// services of other nodes from the catalog (needs node:write on those nodes).
+// If this node does not hold the lock, it removes only its own service.
+func (m *Manager) deregisterMultiMasterService(redisState state.Redis) {
+	current := m.snapshot()
+
+	if !current.Master {
+		m.logger.Warn("Multiple masters found and we do not hold the lock, deregistering our own service")
+		m.deregisterService()
+		return
+	}
+
+	nodeName, err := m.localNodeName()
+	if err != nil {
+		m.handleConsulError(err)
+		return
+	}
+
+	for _, service := range current.MasterServices {
+		if service.Node == nodeName && service.ServiceID == m.config.serviceID {
+			continue
+		}
+
+		m.logger.Infof("Deregistering foreign master service %s:%d, %s on node %s", service.Address, service.Port, service.ServiceID, service.Node)
+		err := m.client.CatalogDeregister(service.Node, service.ServiceID)
+		m.handleConsulError(err)
+	}
 }
 
 // setConsulCheckStatus sets consul status check TTL and output
@@ -271,6 +414,15 @@ func (m *Manager) setConsulCheckStatus(redisState state.Redis) {
 
 	m.logger.Debug("Updating Check TTL for service")
 	err := m.client.UpdateTTL(m.config.checkID, redisState.InfoString, "passing")
+
+	// if the check don't have a TTL, it mean that the service + check is gone
+	// deregister the service+check so we can register a new one
+	if err != nil && strings.Contains(err.Error(), "does not have associated TTL") {
+		m.logger.Warnf("Consul check is gone, will register service again: %v", err)
+		m.deregisterService()
+		return
+	}
+
 	m.handleConsulError(err)
 }
 
@@ -308,53 +460,70 @@ func (m *Manager) watchConsulMasterService() {
 			return
 
 		case <-timer.C:
-			services, meta, err := m.client.ServiceHealth(serviceName, serviceTag, true, q)
-			m.handleConsulError(err)
-			if err != nil {
+			if err := m.pollMasterService(serviceName, serviceTag, q); err != nil {
 				timer.Reset(m.backoff.ForAttempt(m.backoff.Attempt()))
 				continue
 			}
 
 			timer.Reset(duration)
-
-			if q.WaitIndex == meta.LastIndex {
-				m.logger.Debugf("No change in master service health")
-				continue
-			}
-
-			q.WaitIndex = meta.LastIndex
-
-			if len(services) == 0 {
-				m.logger.Warn("No (healthy) master service found in Consul catalog")
-				continue
-			}
-
-			if len(services) > 1 {
-				m.logger.Error("More than 1 (healthy) master service found in Consul catalog")
-				m.state.MasterServices = m.GetMasterServices(services)
-				m.emit()
-				continue
-			}
-
-			master := services[0]
-
-			if m.state.MasterAddr == master.Service.Address && m.state.MasterPort == master.Service.Port {
-				m.logger.Debugf("No change in master service configuration")
-				continue
-			}
-
-			// handle If master is registred in consul with port only
-			// Use node IP insted of service IP
-			if master.Service.Address != "" {
-				m.state.MasterAddr = master.Service.Address
-			} else {
-				m.state.MasterAddr = master.Node.Address
-			}
-
-			m.state.MasterPort = master.Service.Port
-			m.emit()
 		}
 	}
+}
+
+// pollMasterService does one query for the master service and emits
+// a state change if the master service changed
+func (m *Manager) pollMasterService(serviceName, serviceTag string, q *consulapi.QueryOptions) error {
+	services, meta, err := m.client.ServiceHealth(serviceName, serviceTag, true, q)
+	m.handleConsulError(err)
+	if err != nil {
+		// after a leader change the raft index can move, a stale
+		// WaitIndex can block the query for the full WaitTime
+		q.WaitIndex = 1
+		return err
+	}
+
+	// handleConsulError() can clear the master address from another
+	// go-routine, do not skip the update if the address is empty
+	current := m.snapshot()
+	if q.WaitIndex == meta.LastIndex && current.MasterAddr != "" {
+		m.logger.Debugf("No change in master service health")
+		return nil
+	}
+
+	q.WaitIndex = meta.LastIndex
+
+	if len(services) == 0 {
+		m.logger.Warn("No (healthy) master service found in Consul catalog")
+		return nil
+	}
+
+	if len(services) > 1 {
+		m.logger.Error("More than 1 (healthy) master service found in Consul catalog")
+		masterServices := m.GetMasterServices(services)
+		m.update(func(s *state.Consul) { s.MasterServices = masterServices })
+		return nil
+	}
+
+	master := services[0]
+
+	// handle If master is registred in consul with port only
+	// Use node IP insted of service IP
+	masterAddr := master.Service.Address
+	if masterAddr == "" {
+		masterAddr = master.Node.Address
+	}
+
+	if current.MasterAddr == masterAddr && current.MasterPort == master.Service.Port && len(current.MasterServices) <= 1 {
+		m.logger.Debugf("No change in master service configuration")
+		return nil
+	}
+
+	m.update(func(s *state.Consul) {
+		s.MasterAddr = masterAddr
+		s.MasterPort = master.Service.Port
+		s.MasterServices = nil
+	})
+	return nil
 }
 
 // GetMasterServices
@@ -370,45 +539,85 @@ func (m *Manager) GetMasterServices(services []*consulapi.ServiceEntry) []state.
 		}
 		cs.Port = service.Service.Port
 		cs.ServiceID = service.Service.ID
+		cs.Node = service.Node.Node
 		css = append(css, cs)
 	}
 	return css
 }
 
-// handleConsulError is the error handler
-func (m *Manager) handleConsulError(err error) {
-	// if no error
+// isConsulDown returns true for transport and server errors, for example
+// when the agent is down or when the Consul servers have no leader.
+func isConsulDown(err error) bool {
 	if err == nil {
-		// if state is healthy do nothing
-		if m.state.Healthy {
-			return
+		return false
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	s := err.Error()
+	for _, needle := range []string{
+		"dial tcp",
+		"No cluster leader",
+		"rpc error",
+		"Unexpected response code: 500",
+		"Unexpected response code: 502",
+		"Unexpected response code: 503",
+		"connection refused",
+		"connection reset",
+		"EOF",
+		"context deadline exceeded",
+	} {
+		if strings.Contains(s, needle) {
+			return true
 		}
+	}
 
-		// reset exponential backoff
-		m.backoff.Reset()
+	return false
+}
 
-		// mark us as healthy
-		m.state.Healthy = true
-		m.emit()
-
+// markConsulHealthy is called only after a call that needs a Consul
+// leader succeeded: Lock(), session create, or a consistent KV read.
+// Agent-local calls succeed without a leader and must not call it.
+func (m *Manager) markConsulHealthy() {
+	if m.snapshot().Healthy {
 		return
 	}
 
-	// if we get connection refused, we are not healthy
-	if m.state.Healthy && strings.Contains(err.Error(), "dial tcp") {
-		m.state.Healthy = false
-		m.emit()
+	// reset exponential backoff
+	m.backoff.Reset()
 
-		m.deregisterService()
-	}
+	m.logger.Info("Consul is healthy again")
+	m.update(func(s *state.Consul) { s.Healthy = true })
+}
 
-	// if the check don't have a TTL, it mean that the service + check is gone
-	// deregister the service+check so we can register a new one
-	if strings.Contains(err.Error(), "does not have associated TTL") {
-		m.deregisterService()
+// handleConsulError logs the error and marks Consul as not healthy
+// for transport and server errors. It never marks Consul healthy.
+func (m *Manager) handleConsulError(err error) {
+	if err == nil {
+		return
 	}
 
 	m.logger.Errorf("Consul error: %v", err)
+
+	if !isConsulDown(err) || !m.snapshot().Healthy {
+		return
+	}
+
+	// Mark Consul as not healthy. The reconciler then freezes the Redis
+	// topology. Do not deregister the service: the agent-local call works
+	// while the servers have no leader, and clients can continue to use
+	// the current master. Clear the master address so that a stale value
+	// can not cause SLAVEOF to our own address.
+	m.logger.Warn("Consul is not healthy, freezing the Redis topology")
+	m.update(func(s *state.Consul) {
+		s.Healthy = false
+		s.MasterAddr = ""
+		s.MasterPort = 0
+		s.MasterServices = nil
+	})
 }
 
 func (m *Manager) CommandRunner() {
@@ -449,8 +658,7 @@ func (m *Manager) start() {
 	go m.continuouslyAcquireConsulLeadership()
 	go m.watchConsulMasterService()
 
-	m.state.Ready = true
-	m.emit()
+	m.update(func(s *state.Consul) { s.Ready = true })
 }
 
 func (m *Manager) GetStateReader() <-chan state.Consul {
