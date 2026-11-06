@@ -60,11 +60,13 @@ func NewConnection(c *cli.Context, redisConfig redis.Config) (*Manager, error) {
 
 	announceAddr := c.String("announce-addr")
 	if announceAddr == "" {
-		redisHost := strings.Split(redisConfig.Address, ":")[0]
-		redisPort := strings.Split(redisConfig.Address, ":")[1]
+		redisHost, redisPort, err := net.SplitHostPort(redisConfig.Address)
+		if err != nil {
+			return nil, fmt.Errorf("Trouble extracting host and port from redis-addr [%s]: %v", redisConfig.Address, err)
+		}
 		// If REDIS_ADDR is declared as localhost register only port, and rely on consul to bring the agents IP
 		if redisHost == "127.0.0.1" || redisHost == "localhost" || redisHost == "::1" {
-			consulConfig.announceAddr = ":" + redisPort
+			consulConfig.announceAddr = net.JoinHostPort("", redisPort)
 		} else {
 			consulConfig.announceAddr = redisConfig.Address
 		}

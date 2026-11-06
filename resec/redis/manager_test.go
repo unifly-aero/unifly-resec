@@ -131,6 +131,15 @@ repl_backlog_histlen:1526`),
 				MasterPort:           6379,
 			},
 		},
+		{name: "loading", str: "loading:1\r\nrole:master", want: state.RedisStatus{Role: "master", Loading: true}},
+		{name: "not loading", str: "loading:0", want: state.RedisStatus{}},
+		{name: "bad master_port", str: "master_port:abc", want: state.RedisStatus{}},
+		{name: "bad link down seconds", str: "master_link_down_since_seconds:x", want: state.RedisStatus{}},
+		{name: "sync in progress non-zero", str: "master_sync_in_progress:2", want: state.RedisStatus{MasterSyncInProgress: true}},
+		{name: "comment lines skipped", str: "# Server\r\nrole:slave\r\n# Replication\r\n", want: state.RedisStatus{Role: "slave"}},
+		{name: "line without colon", str: "garbage\r\nrole:master", want: state.RedisStatus{Role: "master"}},
+		{name: "IPv6 master host", str: "role:slave\r\nmaster_host:fd00::1", want: state.RedisStatus{Role: "slave", MasterHost: "fd00::1"}},
+		{name: "LF only input", str: "# Replication\nrole:master\nmaster_port:6379", want: state.RedisStatus{Role: "master", MasterPort: 6379}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -149,4 +158,18 @@ func TestManager_parseKeyValue_IPv6(t *testing.T) {
 	kv := m.parseKeyValue("role:slave\r\nmaster_host:fd00::1\r\nmaster_port:6379")
 	assert.Equal(t, "fd00::1", kv["master_host"])
 	assert.Equal(t, "6379", kv["master_port"])
+}
+
+func TestManager_parseKeyValue_LFOnly(t *testing.T) {
+	m := &Manager{}
+	kv := m.parseKeyValue("role:master\nmaster_port:6379")
+	assert.Equal(t, map[string]string{"role": "master", "master_port": "6379"}, kv)
+}
+
+func TestManager_parseKeyValue_CommentKeySkipped(t *testing.T) {
+	m := &Manager{}
+	kv := m.parseKeyValue("# Server\r\nrole:master")
+	_, ok := kv["# Server"]
+	assert.False(t, ok)
+	assert.Equal(t, "master", kv["role"])
 }

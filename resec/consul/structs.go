@@ -17,6 +17,7 @@ type Manager struct {
 	config       *config           // configuration for this connection
 	lockCh       chan struct{}     // closed on shutdown to abort a blocked Lock() call
 	lockChOnce   sync.Once         // makes sure lockCh is closed only once
+	stopOnce     sync.Once         // makes sure stopCh is closed only once
 	mu           sync.Mutex        // protects state and config.voluntarilyReleaseLockCh
 	lockErrorCh  <-chan struct{}   // lock error channel used by Consul SDK to notify about errors related to the lock
 	logger       *log.Entry        // logger for the consul connection struct

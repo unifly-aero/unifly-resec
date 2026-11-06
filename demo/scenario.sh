@@ -105,6 +105,25 @@ expect_no_damage() { # <prefix> <since>
   check "$1 no crash resec-2" 0 "$(count_log "$2" resec-2 'panic\|fatal')"
 }
 
+wait_steady() { # <max-seconds>  waits until the cluster is steady for 3 polls in a row
+  # the catalog can show stale state for a few seconds after the servers are
+  # back, so the steady state must hold for 3 polls in a row
+  local max=$1 ok=0 i r1 r2
+  log "waiting up to ${max}s to settle"
+  for i in $(seq 1 $((max / 5))); do
+    r1=$(role redis-resec-1); r2=$(role redis-resec-2)
+    if [ "$(health 8081)" = 200 ] && [ "$(health 8082)" = 200 ] && [ "$(masters_in_catalog)" = 1 ] \
+       && [ "$(lock_session)" = 1 ] && [ "$(resec_masters)" = 1 ] \
+       && [ "$(printf '%s\n%s\n' "$r1" "$r2" | grep -c '^master$')" = 1 ]; then
+      ok=$((ok + 1)); [ $ok -ge 3 ] && break
+    else
+      ok=0
+    fi
+    sleep 5
+  done
+  log "settled after $((i * 5))s"; snapshot
+}
+
 run_outage() { # <name> <break-cmd> <restore-cmd>
   local name=$1 brk=$2 restore=$3 start r1 r2
   begin "$name"
@@ -119,19 +138,7 @@ run_outage() { # <name> <break-cmd> <restore-cmd>
   FLAPS=$(( $(count_log "$start" resec-1 'healthy again') + $(count_log "$start" resec-2 'healthy again') ))
   marker "$name: restoring servers"
   eval "$restore"
-  log "waiting up to ${SETTLE}s to settle"
-  # the catalog can show stale state for a few seconds after the servers are
-  # back, so the steady state must hold for 3 polls in a row
-  ok=0
-  for i in $(seq 1 $((SETTLE / 5))); do
-    if [ "$(health 8081)" = 200 ] && [ "$(health 8082)" = 200 ] && [ "$(masters_in_catalog)" = 1 ] && [ "$(lock_session)" = 1 ] && [ "$(resec_masters)" = 1 ]; then
-      ok=$((ok + 1)); [ $ok -ge 3 ] && break
-    else
-      ok=0
-    fi
-    sleep 5
-  done
-  log "settled after $((i * 5))s"; snapshot
+  wait_steady "$SETTLE"
   expect_steady "$name/after"
   expect_no_damage "$name" "$start"
   finish
@@ -165,14 +172,13 @@ main() {
   [ $# -eq 0 ] && set -- quorum gone hang replaced
   RUN=("$@")
   begin baseline
+  # a stack left running from the last run keeps a stale lock session and a
+  # stale master service, so always start from a clean stack
+  log "removing the old stack"
+  $C down -v --remove-orphans >/dev/null 2>&1
   log "starting stack (observer: http://localhost:8090)"
   $C up -d --build >/dev/null 2>&1
-  log "waiting for bootstrap (max 120s)"
-  for i in $(seq 1 24); do
-    [ "$(health 8081)" = 200 ] && [ "$(health 8082)" = 200 ] && [ "$(lock_session)" = 1 ] && break
-    sleep 5
-  done
-  snapshot
+  wait_steady 120
   expect_steady baseline
   finish
   for s in "$@"; do

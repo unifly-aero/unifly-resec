@@ -23,6 +23,8 @@ type helper struct {
 	redisCommandCh         chan redis.Command
 	redisCommandsExpected  []redis.CommandName
 	redisCommandsSeen      []redis.CommandName
+	redisCommandsFull      []redis.Command  // full payloads, never reset
+	consulCommandsFull     []consul.Command // full payloads, never reset
 	redisStateCh           chan state.Redis
 	t                      *testing.T
 	mu                     sync.Mutex // protects the *CommandsSeen slices
@@ -38,10 +40,12 @@ func (h *helper) consume() {
 			case cmd := <-h.redisCommandCh:
 				h.mu.Lock()
 				h.redisCommandsSeen = append(h.redisCommandsSeen, cmd.Name())
+				h.redisCommandsFull = append(h.redisCommandsFull, cmd)
 				h.mu.Unlock()
 			case cmd := <-h.consulCommandCh:
 				h.mu.Lock()
 				h.consulCommandsSeen = append(h.consulCommandsSeen, cmd.Name())
+				h.consulCommandsFull = append(h.consulCommandsFull, cmd)
 				h.mu.Unlock()
 			}
 		}
@@ -122,6 +126,8 @@ func newTestReconciler(t *testing.T) *helper {
 		redisCommandCh:         redisCommandCh,
 		redisStateCh:           redisStateCh,
 		signalCh:               make(chan os.Signal, 0),
+		debugSignalCh:          make(chan os.Signal, 1),
+		reconcileCh:            make(chan interface{}, 10),
 		stopCh:                 make(chan interface{}, 0),
 		logger:                 log.WithField("testing", true),
 	}
@@ -137,4 +143,32 @@ func newTestReconciler(t *testing.T) *helper {
 
 	h.reset()
 	return h
+}
+
+// redisCommands returns all full Redis commands seen so far
+func (h *helper) redisCommands() []redis.Command {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]redis.Command(nil), h.redisCommandsFull...)
+}
+
+// consulCommands returns all full Consul commands seen so far
+func (h *helper) consulCommands() []consul.Command {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]consul.Command(nil), h.consulCommandsFull...)
+}
+
+// seenConsul returns the Consul command names seen so far
+func (h *helper) seenConsul() []consul.CommandName {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]consul.CommandName(nil), h.consulCommandsSeen...)
+}
+
+// seenRedis returns the Redis command names seen so far
+func (h *helper) seenRedis() []redis.CommandName {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]redis.CommandName(nil), h.redisCommandsSeen...)
 }

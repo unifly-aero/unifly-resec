@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync"
 	"syscall"
 	"time"
@@ -54,6 +55,8 @@ type Reconciler struct {
 	stateServerOn          bool                  // activate the state server?
 	stateListenAddress     string                // address:port for status server
 	httpServer             *http.Server          // state server (nil if not active)
+	consulManager          *consul.Manager       // Consul manager, stopped by Close
+	redisManager           *redis.Manager        // Redis manager, stopped by Close
 
 	consulHealth         func(context.Context) error // live Consul check used by /health
 	consulHealthTimeout  time.Duration               // timeout for the live Consul check
@@ -68,6 +71,21 @@ type Reconciler struct {
 	sync.Mutex
 }
 
+// Close stops the signal handlers and the manager goroutines. It is for
+// tests and for callers that never call Run.
+func (r *Reconciler) Close() {
+	signal.Stop(r.signalCh)
+	signal.Stop(r.debugSignalCh)
+
+	if r.consulManager != nil {
+		r.consulManager.Close()
+	}
+
+	if r.redisManager != nil {
+		r.redisManager.Close()
+	}
+}
+
 // sendRedisCommand will build and send a Redis command
 func (r *Reconciler) sendRedisCommand(cmd redis.CommandName) {
 	r.redisCommandCh <- redis.NewCommand(cmd, r.consulState)
@@ -80,11 +98,15 @@ func (r *Reconciler) sendConsulCommand(cmd consul.CommandName) {
 
 // Run starts the procedure
 func (r *Reconciler) Run() {
-	// Default state
+	// Default state.
+	// Only the debounced callback reads and writes currentState. The debounce
+	// package starts each callback on a new timer goroutine. The mutex
+	// protects currentState and keeps the state transitions in order.
 	currentState := ResultUnknown
+	var currentStateMu sync.Mutex
 
-	// Configure logger
-	r.logger = log.WithField("system", "reconciler").WithField("state", currentState)
+	// Configure logger. Never change it after this line. Other goroutines read it.
+	r.logger = log.WithField("system", "reconciler")
 
 	// Fire up our internal state reader, consuming updates from Consul and Redis
 	go r.stateReader()
@@ -140,6 +162,9 @@ func (r *Reconciler) Run() {
 		// evaluate state and reconcile the systems under control
 		case <-r.reconcileCh:
 			debounced(func() {
+				currentStateMu.Lock()
+				defer currentStateMu.Unlock()
+
 				newState := r.evaluate()
 
 				// always apply the state, even if its the same (for cases like ResultUpdateService)
@@ -150,11 +175,9 @@ func (r *Reconciler) Run() {
 					return
 				}
 
-				// Update the reconciler logger to reflect the new state
-				r.logger = r.logger.WithField("state", newState)
-
 				// Log the reconciler state change
 				r.logger.
+					WithField("state", newState).
 					WithField("old_state", currentState).
 					Infof("Reconciler state transitioned from '%s' to '%s'", currentState, newState)
 
@@ -169,15 +192,17 @@ func (r *Reconciler) apply(state resultType) {
 	span := tracer.StartSpan("resec.apply", tracer.ResourceName(string(state)))
 	defer span.Finish()
 
+	logger := r.logger.WithField("state", state)
+
 	switch state {
 	case ResultMissingState:
-		r.logger.Debug("Not ready to reconcile yet, missing initial state")
+		logger.Debug("Not ready to reconcile yet, missing initial state")
 
 	case ResultConsulNotHealthy:
-		r.logger.Debugf("Can't reconcile, Consul is not healthy")
+		logger.Debugf("Can't reconcile, Consul is not healthy")
 
 	case ResultRedisNotHealthy:
-		r.logger.Debugf("Redis is not healthy, deregister Consul service and don't do any further changes")
+		logger.Debugf("Redis is not healthy, deregister Consul service and don't do any further changes")
 		r.sendConsulCommand(consul.ReleaseLockCommand)
 		r.sendConsulCommand(consul.DeregisterServiceCommand)
 
@@ -185,30 +210,30 @@ func (r *Reconciler) apply(state resultType) {
 		r.sendConsulCommand(consul.UpdateServiceCommand)
 
 	case ResultRunAsMaster:
-		r.logger.Info("Configure Redis as master")
+		logger.Info("Configure Redis as master")
 		r.sendRedisCommand(redis.RunAsMasterCommand)
 		r.sendConsulCommand(consul.RegisterServiceCommand)
 
 	case ResultNoMasterElected:
-		r.logger.Warn("Currently no master Redis is elected in Consul catalog, can't enslave local Redis")
+		logger.Warn("Currently no master Redis is elected in Consul catalog, can't enslave local Redis")
 
 	case ResultRunAsSlave:
-		r.logger.Info("Reconfigure Redis as slave")
+		logger.Info("Reconfigure Redis as slave")
 		r.sendRedisCommand(redis.RunAsSlaveCommand)
 
 	case ResultMasterSyncInProgress:
-		r.logger.Warn("Master sync in progress, can't serve traffic")
+		logger.Warn("Master sync in progress, can't serve traffic")
 		r.sendConsulCommand(consul.DeregisterServiceCommand)
 
 	case ResultMasterLinkDown:
-		r.logger.Warn("Master link is down, can't serve traffic")
+		logger.Warn("Master link is down, can't serve traffic")
 		r.sendConsulCommand(consul.DeregisterServiceCommand)
 	case ResultMultiMaster:
-		r.logger.Warn("Detected multiple masters trying to unregister")
+		logger.Warn("Detected multiple masters trying to unregister")
 		r.sendConsulCommand(consul.DeregisterMultiMasterCommand)
 
 	default:
-		r.logger.Errorf("Unknown state: %s", state)
+		logger.Errorf("Unknown state: %s", state)
 	}
 }
 
@@ -557,7 +582,7 @@ func (r *Reconciler) stop() {
 		consulStopped := false
 
 		timeoutCh := time.NewTimer(1 * time.Minute)
-		intervalCh := time.NewTicker(1 * time.Second)
+		intervalCh := time.NewTicker(50 * time.Millisecond)
 
 		for {
 			select {

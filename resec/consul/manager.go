@@ -76,9 +76,16 @@ func (m *Manager) cleanup() {
 
 	m.logger.Debug("Closing stopCh")
 	m.lockChOnce.Do(func() { close(m.lockCh) })
-	close(m.stopCh)
+	m.stopOnce.Do(func() { close(m.stopCh) })
 
 	m.update(func(s *state.Consul) { s.Stopped = true })
+}
+
+// Close stops the goroutines of the manager. It does not release the lock
+// and it does not deregister the service. It is safe to call it more than once.
+func (m *Manager) Close() {
+	m.lockChOnce.Do(func() { close(m.lockCh) })
+	m.stopOnce.Do(func() { close(m.stopCh) })
 }
 
 // AnnounceAddr returns the host and port announced to Consul.
@@ -100,16 +107,23 @@ func (m *Manager) watchConsulRecovery() {
 			return
 
 		case <-ticker.C:
-			if m.snapshot().Healthy {
-				continue
-			}
-
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := m.LockKeyHealthy(ctx); err != nil {
-				m.logger.Debugf("Consul recovery check failed: %v", err)
-			}
-			cancel()
+			m.recoveryCheck()
 		}
+	}
+}
+
+// recoveryCheck is one tick of watchConsulRecovery. It does nothing while
+// Consul is healthy.
+func (m *Manager) recoveryCheck() {
+	if m.snapshot().Healthy {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := m.LockKeyHealthy(ctx); err != nil {
+		m.logger.Debugf("Consul recovery check failed: %v", err)
 	}
 }
 
@@ -309,11 +323,13 @@ func (m *Manager) registerService(redisState state.Redis) {
 	serviceID := m.getConsulServiceID()
 	replicationStatus := m.getReplicationStatus()
 
-	m.config.serviceID = serviceID + "@" + m.config.announceAddr
-	m.config.checkID = m.config.serviceID + ":replication-status-check"
+	// Keep the IDs in local variables. Set them in the config only after
+	// the service and the check are both registered.
+	fullServiceID := serviceID + "@" + m.config.announceAddr
+	checkID := fullServiceID + ":replication-status-check"
 
 	serviceInfo := &consulapi.AgentServiceRegistration{
-		ID:   m.config.serviceID,
+		ID:   fullServiceID,
 		Port: m.config.announcePort,
 		Name: m.getConsulServiceName(),
 		Tags: m.config.serviceTagsByRole[replicationStatus],
@@ -335,8 +351,8 @@ func (m *Manager) registerService(redisState state.Redis) {
 
 	check := &consulapi.AgentCheckRegistration{
 		Name:      "Resec: " + replicationStatus + " replication status",
-		ID:        m.config.checkID,
-		ServiceID: m.config.serviceID,
+		ID:        checkID,
+		ServiceID: fullServiceID,
 		AgentServiceCheck: consulapi.AgentServiceCheck{
 			TTL:                            m.config.serviceTTL.String(),
 			Status:                         "warning",
@@ -346,6 +362,14 @@ func (m *Manager) registerService(redisState state.Redis) {
 
 	err = m.client.CheckRegister(check)
 	m.handleConsulError(err)
+	if err != nil {
+		// Do not leave a service without a check in the catalog.
+		m.handleConsulError(m.client.ServiceDeregister(fullServiceID))
+		return
+	}
+
+	m.config.serviceID = fullServiceID
+	m.config.checkID = checkID
 }
 
 // deregisterService will deregister the consul service from Consul catalog

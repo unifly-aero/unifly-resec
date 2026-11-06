@@ -11,9 +11,18 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// emit will send a state update to the reconciler
-func (m *Manager) emit() {
-	m.stateCh <- *m.state
+// emit will send a state update to the reconciler.
+// The caller copies the state under m.mu and sends the copy.
+func (m *Manager) emit(s state.Redis) {
+	m.stateCh <- s
+}
+
+// isReady returns true when Redis is ready.
+func (m *Manager) isReady() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.state.Ready
 }
 
 // runAsMaster sets the instance to be the master
@@ -22,8 +31,8 @@ func (m *Manager) runAsMaster() error {
 		return err
 	}
 
-	m.logger = m.logger.WithField("role", "master")
-	m.logger.Info("Promoted redis to Master")
+	logger := m.logger.WithField("role", "master")
+	logger.Info("Promoted redis to Master")
 	return nil
 }
 
@@ -35,8 +44,8 @@ func (m *Manager) runAsSlave(masterAddress string, masterPort int) error {
 		return fmt.Errorf("Could not enslave redis to be slave of %s:%d (%v)", masterAddress, masterPort, err)
 	}
 
-	m.logger = m.logger.WithField("role", "slave")
-	m.logger.Infof("Enslaved redis to be slave of %s:%d", masterAddress, masterPort)
+	logger := m.logger.WithField("role", "slave")
+	logger.Infof("Enslaved redis to be slave of %s:%d", masterAddress, masterPort)
 	return nil
 }
 
@@ -55,10 +64,19 @@ func (m *Manager) disconnectUsers() error {
 }
 
 func (m *Manager) cleanup() {
-	close(m.stopCh)
+	m.stopOnce.Do(func() { close(m.stopCh) })
 
+	m.mu.Lock()
 	m.state.Stopped = true
-	m.emit()
+	s := *m.state
+	m.mu.Unlock()
+
+	m.emit(s)
+}
+
+// Close stops the goroutines of the manager. It is safe to call it more than once.
+func (m *Manager) Close() {
+	m.stopOnce.Do(func() { close(m.stopCh) })
 }
 
 func (m *Manager) CommandRunner() {
@@ -79,7 +97,7 @@ func (m *Manager) CommandRunner() {
 				m.cleanup()
 
 			case RunAsMasterCommand:
-				if !m.state.Ready {
+				if !m.isReady() {
 					m.logger.Warnf("Got 'runAsMaster' command, but Redis is not ready yet - ignoring")
 					continue
 				}
@@ -89,7 +107,7 @@ func (m *Manager) CommandRunner() {
 				}
 
 			case RunAsSlaveCommand:
-				if !m.state.Ready {
+				if !m.isReady() {
 					m.logger.Warnf("Got 'runAsSlave' command, but Redis is not ready yet - ignoring")
 					continue
 				}
@@ -109,27 +127,39 @@ func (m *Manager) CommandRunner() {
 
 // watchStatus checks redis replication status
 func (m *Manager) watchStatus() {
+	m.mu.Lock()
 	if m.watcherRunning {
+		m.mu.Unlock()
 		m.logger.Warn("Trying to start status watcher, but already running, ignoring...")
 		return
 	}
 	m.watcherRunning = true
+	m.mu.Unlock()
 
 	defer func() {
+		m.mu.Lock()
 		m.watcherRunning = false
+		m.mu.Unlock()
 	}()
 
 	interval := time.Second
 	timer := time.NewTimer(interval)
+	defer timer.Stop()
 
 	for {
 		select {
+		case <-m.stopCh:
+			return
+
 		case <-timer.C:
 			result, err := m.client.Info(context.Background()).Result()
 			// any failure will trigger a disconnect event
 			if err != nil {
+				m.mu.Lock()
 				m.state.Healthy = false
-				m.emit()
+				s := *m.state
+				m.mu.Unlock()
+				m.emit(s)
 
 				// Lets start backing off in case it's a long standing issue that is going on
 				backoffDuration := m.backoff.Duration()
@@ -149,6 +179,7 @@ func (m *Manager) watchStatus() {
 
 			// If Redis is loading data from disk, do not mark us as healthy
 			// If Redis is _not_ loading data from disk, we're healthy
+			m.mu.Lock()
 			m.state.Healthy = !info.Loading
 
 			// Mark Redis as "ready" (e.g. we can connect)
@@ -157,7 +188,9 @@ func (m *Manager) watchStatus() {
 			// Update state with most recent output
 			m.state.Info = info
 			m.state.InfoString = result
-			m.emit()
+			s := *m.state
+			m.mu.Unlock()
+			m.emit(s)
 		}
 	}
 }
@@ -223,8 +256,9 @@ func (m *Manager) parseInfoResult(str string) state.RedisStatus {
 func (m *Manager) parseKeyValue(str string) map[string]string {
 	res := make(map[string]string)
 
-	lines := strings.Split(str, "\r\n")
+	lines := strings.Split(str, "\n")
 	for _, line := range lines {
+		line = strings.TrimRight(line, "\r")
 		if strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -235,7 +269,7 @@ func (m *Manager) parseKeyValue(str string) map[string]string {
 			continue
 		}
 
-		res[pair[0]] = pair[1]
+		res[strings.TrimSpace(pair[0])] = pair[1]
 	}
 
 	return res

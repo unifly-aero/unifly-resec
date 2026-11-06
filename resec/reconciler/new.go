@@ -1,18 +1,29 @@
 package reconciler
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/aireuropa/resec/resec/consul"
 	"github.com/aireuropa/resec/resec/redis"
 	"github.com/urfave/cli/v2"
 )
 
+// minReconcileInterval is the lowest allowed value of healthcheck-timeout.
+const minReconcileInterval = 500 * time.Millisecond
+
 // setup returns the default configuration for the ReSeC
 func NewReconciler(c *cli.Context) (*Reconciler, error) {
+	// The debounce timer restarts on each event. A short interval can starve
+	// the reconcile loop. Reject it at start.
+	if interval := c.Duration("healthcheck-timeout"); interval < minReconcileInterval {
+		return nil, fmt.Errorf("healthcheck-timeout (%s) must be at least %s", interval, minReconcileInterval)
+	}
+
 	redisConnection, err := redis.NewConnection(c)
 	if err != nil {
 		return nil, err
@@ -24,6 +35,8 @@ func NewReconciler(c *cli.Context) (*Reconciler, error) {
 	}
 
 	reconciler := &Reconciler{
+		consulManager:          consulConnection,
+		redisManager:           redisConnection,
 		consulCommandCh:        consulConnection.GetCommandWriter(),
 		consulStateCh:          consulConnection.GetStateReader(),
 		debugSignalCh:          make(chan os.Signal, 1),

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"sort"
 	"strings"
@@ -26,6 +27,15 @@ func main() {
 
 	}
 
+	app := newApp()
+
+	if err := app.Run(os.Args); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// newApp builds the CLI application
+func newApp() *cli.App {
 	app := cli.NewApp()
 	app.Name = "resec"
 	app.Usage = "Redis cluster manager"
@@ -173,7 +183,7 @@ func main() {
 		case "gelf":
 			log.SetFormatter(&gelf.GelfFormatter{})
 		default:
-			log.Fatalf("Invalid log format '%s', please use on of [text, json, gelf]", c.String("log-format"))
+			return fmt.Errorf("invalid log format %q, use one of text, json, gelf", c.String("log-format"))
 		}
 
 		log.Infof("Starting ReSeC %s", Version)
@@ -192,7 +202,5 @@ func main() {
 	sort.Sort(cli.FlagsByName(app.Flags))
 	sort.Sort(cli.CommandsByName(app.Commands))
 
-	if err := app.Run(os.Args); err != nil {
-		log.Fatal(err)
-	}
+	return app
 }

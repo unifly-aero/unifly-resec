@@ -1,6 +1,8 @@
 package redis
 
 import (
+	"sync"
+
 	"github.com/aireuropa/resec/resec/state"
 	"github.com/jpillora/backoff"
 	"github.com/redis/go-redis/v9"
@@ -16,6 +18,8 @@ type Manager struct {
 	stateCh        chan state.Redis // redis state channel to publish updates to the reconciler
 	commandCh      chan Command
 	stopCh         chan interface{}
+	stopOnce       sync.Once  // closes stopCh only once
+	mu             sync.Mutex // protects state and watcherRunning
 	watcherRunning bool
 }
 

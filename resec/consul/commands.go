@@ -33,6 +33,11 @@ func (c *Command) String() string {
 	return string(c.name)
 }
 
+// RedisState returns the Redis state sent with the command
+func (c *Command) RedisState() state.Redis {
+	return c.redisState
+}
+
 // NewCommand will create a Command object
 func NewCommand(cmd CommandName, redisState state.Redis) Command {
 	return Command{

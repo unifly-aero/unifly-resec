@@ -24,6 +24,11 @@ func (c *Command) String() string {
 	return string(c.name)
 }
 
+// ConsulState returns the Consul state sent with the command
+func (c *Command) ConsulState() state.Consul {
+	return c.consulState
+}
+
 func NewCommand(cmd CommandName, consulState state.Consul) Command {
 	return Command{
 		name:        cmd,
