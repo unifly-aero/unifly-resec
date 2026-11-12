@@ -16,6 +16,11 @@ test: requirements
 	@echo "=> go test ./..."
 	@go test ./...
 
+# Run integration tests (needs `consul` and `redis-server` in PATH)
+.PHONY: test-integration
+test-integration:
+	RESEC_INTEGRATION=1 go test -tags integration -race -count=1 -timeout 10m ./resec/integration/...
+
 # Install requirements needed for the project to build
 .PHONY: requirements
 requirements:
